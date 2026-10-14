@@ -22,7 +22,7 @@ from shapely.validation import make_valid
 import geopandas as gpd
 
 from .._log import log as _log
-from .utils import get_dominant_huc8, list_input_tifs
+from .utils import get_dominant_huc8, list_input_tifs, flood_polygon, write_extent_geojson
 
 
 class FemaBleProcessor:
@@ -35,6 +35,22 @@ class FemaBleProcessor:
     NODATA_VAL = -9999
     BLOCK_SIZE = 512
     SIMPLIFY_TOL = 0.0001  # ~11 m at the equator
+
+    # Extent GeoJSON is simplified by this many metres (EPSG:5070) to stay
+    # light; the metadata/AOI geometry is not affected. None disables it.
+    GEOJSON_SIMPLIFY_TOL = 10.0
+
+    # metadata.json fields copied onto the extent GeoJSON feature.
+    GEOJSON_FIELDS = (
+        "File_Name",
+        "Full form of the sensor code",
+        "HUC8",
+        "Resolution in meter",
+        "Extent",
+        "State",
+        "River Basin Name",
+        "Synthetic Flooding Event (return period (years))",
+    )
 
     def __init__(
         self,
@@ -232,29 +248,14 @@ class FemaBleProcessor:
                 ],
             }
 
+        # Flood polygon from the 5070 raster: every pixel > 0, dissolved
         with rasterio.open(src_5070) as src_geom:
-            arr = src_geom.read(1, masked=True)
-            geom_crs = src_geom.crs
-            mask = arr > 0  # 1 is flood, 0 is dry
-
-            results = (
-                {"properties": {"raster_val": v}, "geometry": s}
-                for i, (s, v) in enumerate(shapes(arr, mask=mask, transform=src_geom.transform))
+            unified_geom = flood_polygon(
+                src_geom.read(1, masked=True), src_geom.transform, self.SIMPLIFY_TOL
             )
-
-        geoms = list(results)
-        if not geoms:
+        if unified_geom is None:
             self.log("No flooded areas found in 5070 raster.")
             return meta, None
-
-        gdf1 = gpd.GeoDataFrame.from_features(geoms)
-        gdf1.set_crs(geom_crs, inplace=True)
-
-        if self.SIMPLIFY_TOL:
-            gdf1["geometry"] = gdf1.simplify(self.SIMPLIFY_TOL, preserve_topology=True)
-            gdf1["geometry"] = gdf1.make_valid()
-
-        unified_geom = unary_union(gdf1.geometry)
 
         return meta, unified_geom
 
@@ -315,15 +316,32 @@ class FemaBleProcessor:
         gdf = gpd.GeoDataFrame([metadata_row], geometry=[unified], crs=crs)
         gdf.to_file(gpkg_path, layer="AOI", driver="GPKG")
 
-    def process(self, input_path, base_dest, event, intermediate_folder=None):
+    # Unified flood polygon + selected metadata -> one-feature GeoJSON
+    def write_extent_geojson(self, unified_geom, geom_crs, meta_dict, geojson_dest, bm_filename):
+        out_path = Path(geojson_dest) / bm_filename.replace("BM.tif", "extent.geojson")
+        return write_extent_geojson(
+            unified_geom,
+            geom_crs,
+            meta_dict,
+            self.GEOJSON_FIELDS,
+            out_path,
+            simplify_tol=self.GEOJSON_SIMPLIFY_TOL,
+            log=self.log,
+        )
+
+    def process(self, input_path, base_dest, event, intermediate_folder=None, geojson_dest=None):
         """
         Process a folder of rasters or a single .tif.
 
         event: the synthetic return-period event (e.g. "100"), applied to all files.
         intermediate_folder: where temporary rasters are written; defaults to a
         fresh temp dir. Removed (best-effort) when processing finishes.
+        geojson_dest: folder for the per-map extent GeoJSON (unified flood
+        polygon + key metadata); must differ from base_dest. None skips it.
         """
         BASE_DEST = Path(base_dest)
+        if geojson_dest is not None and Path(geojson_dest).resolve() == BASE_DEST.resolve():
+            raise ValueError("geojson_dest must be a different folder from base_dest.")
         EVENT = event
 
         tif_list = list_input_tifs(input_path)
@@ -415,6 +433,12 @@ class FemaBleProcessor:
                     self.raster_data_bbox(out_4326, gpkg_path, meta_dict, nodata=self.NODATA_VAL)
                     self.log(f"Wrote AOI: {gpkg_path.name}")
 
+                    # Extent GeoJSON (separate destination)
+                    if geojson_dest is not None:
+                        self.write_extent_geojson(
+                            unified_geom, 5070, meta_dict, geojson_dest, new_filename
+                        )
+
                 except Exception as e:
                     self.log(f"Skipped {tif.name} due to error: {e}")
                     import traceback
@@ -429,14 +453,19 @@ class FemaBleProcessor:
             self._work_dir = None
 
 
-def process(input_path, base_dest, event, intermediate_folder=None, **overrides):
+def process(input_path, base_dest, event, intermediate_folder=None, geojson_dest=None, **overrides):
     """
     Convenience wrapper: run FemaBleProcessor over a folder or a single .tif.
 
     event: synthetic return-period event (e.g. "100").
     intermediate_folder: temp raster dir (defaults to a temp dir, removed after).
+    geojson_dest: folder for the extent GeoJSON (None skips it).
     Config overrides (e.g. source=...) are passed to the processor.
     """
     FemaBleProcessor(**overrides).process(
-        input_path, base_dest, event, intermediate_folder=intermediate_folder
+        input_path,
+        base_dest,
+        event,
+        intermediate_folder=intermediate_folder,
+        geojson_dest=geojson_dest,
     )

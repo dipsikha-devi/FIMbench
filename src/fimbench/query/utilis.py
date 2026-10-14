@@ -223,18 +223,16 @@ def _pretty_date_for_print(rec: Dict[str, Any]) -> str:
     Return a human-readable date string for a record:
     - HWM: 'YYYY-MM-DD to YYYY-MM-DD'
     - Tier 1/2/3: date from event_ts or date_ymd
-    - Tier 4: 'N/A (synthetic)' - return period shown separately
+    - FEMA BLE: 'N/A (synthetic)' - return period shown separately
     """
-    tier_raw = str(rec.get("tier") or rec.get("quality") or "").strip().lower()
-
     # HWM: show date range
     start = rec.get("start_date_ymd")
     end = rec.get("end_date_ymd")
     if isinstance(start, str) and start.strip() and isinstance(end, str) and end.strip():
         return f"{start.strip()} to {end.strip()}"
 
-    # Tier 4 (synthetic/BLE): no event date
-    if "tier_4" in tier_raw or "tier 4" in tier_raw or tier_raw == "4":
+    # FEMA BLE (synthetic): no event date
+    if _is_synthetic_tier(rec):
         return "N/A (synthetic)"
 
     # Tier 1/2/3: prefer event_ts
@@ -286,13 +284,17 @@ def _normalize_tier_for_comparison(s: Any) -> str:
         return ""
     normalized = str(s).lower().strip()
     normalized = re.sub(r"[\s\-_]+", "", normalized)
+    # FEMA BLE maps were labelled Tier_4 in older catalogs; accept either name.
+    if normalized in {"tier4", "ble", "fema"}:
+        normalized = "femable"
     return normalized
 
 
 def _is_synthetic_tier(rec: Dict[str, Any]) -> bool:
-    """Return True when the record is a Tier_4 (synthetic/BLE) event."""
-    tier = str(rec.get("tier") or rec.get("quality") or "").lower()
-    return "tier_4" in tier or "tier 4" in tier or tier.strip() == "4"
+    """Return True when the record is a FEMA BLE (synthetic) event; older
+    catalogs label these Tier_4."""
+    tier = _normalize_tier_for_comparison(rec.get("tier") or rec.get("quality"))
+    return tier in {"femable", "ble", "tier4", "4"}
 
 
 def _return_period_text(rec: Dict[str, Any]) -> str:
@@ -393,7 +395,7 @@ def _context_str(
 def _tier_summary(records: List[Dict[str, Any]]) -> str:
     """
     Build a per-tier count summary string.
-    e.g. 'HWM: 4, Tier_1: 2, Tier_4: 2'
+    e.g. 'HWM: 4, Tier_1: 2, FEMA_BLE: 2'
     """
     counts: Dict[str, int] = {}
     for r in records:

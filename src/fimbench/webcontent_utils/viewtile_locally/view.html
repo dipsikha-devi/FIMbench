@@ -44,7 +44,7 @@ const vg = L.vectorGrid.protobuf(TILES_URL, {
     [LAYER_NAME]: function(props){
       const colors = {
         "Tier_1":"#1b9e77","Tier_2":"#d95f02","Tier_3":"#7570b3",
-        "Tier_4":"#e7298a","Tier_5":"#66a61e"
+        "FEMA_BLE":"#e7298a","Tier_4":"#e7298a","Tier_5":"#66a61e"
       };
       const c = colors[props.tier] || "#2c7fb8";
       return { color: c, weight: 1, fill: false, fillOpacity: 0.15 };

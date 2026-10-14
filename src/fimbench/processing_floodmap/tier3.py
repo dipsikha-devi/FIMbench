@@ -23,20 +23,59 @@ from shapely.validation import make_valid
 import geopandas as gpd
 
 from .._log import log as _log
-from .utils import get_intersected_huc8, list_input_tifs
+from .utils import (
+    get_intersected_huc8,
+    list_input_tifs,
+    flood_polygon,
+    split_flood_datetime,
+    write_extent_geojson,
+)
+from .recurrence_interval import (
+    get_event_recurrence_interval_nwm,
+    get_event_recurrence_interval_usgs,
+)
 
 
 class Tier3Processor:
     """Standardize Tier 3 (Sentinel 1A) flood maps for the FIM database."""
 
     SENSOR_CODE = "S1A"
-    Full_Form = "Sentinel 1A"
+    Full_Form = "Sentinel-1A"
     SOURCE = "Dr. Dan Tian,The University of Alabama, Email id: dtian1@ua.edu"
     Quality = "Tier 3"
 
     NODATA_VAL = -9999
     BLOCK_SIZE = 512
     SIMPLIFY_TOL = 0.0001  # ~11 m at the equator
+
+    # Extent GeoJSON is simplified by this many metres (EPSG:5070) to stay
+    # light; the metadata/AOI geometry is not affected. None disables it.
+    GEOJSON_SIMPLIFY_TOL = 10.0
+
+    # metadata.json fields copied onto the extent GeoJSON feature.
+    GEOJSON_FIELDS = (
+        "File_Name",
+        "Full form of the sensor code",
+        "HUC8",
+        "Resolution in meter",
+        "Extent",
+        "State",
+        "River Basin Name",
+        "Flooding Event",
+        "Event Recurrence Interval (USGS)",
+        "Event Discharge (USGS) [cms]",
+        "USGS Gauge ID",
+        "Event Recurrence Interval (NWM)",
+        "Event Discharge (NWM) [cms]",
+        "Quality",
+    )
+
+    # Reference data for the Event Recurrence Interval lookups (see
+    # recurrence_interval.py). None disables the corresponding lookup.
+    GAGES_SHP = None
+    FLOW_SHP = None
+    RECURR_FOLDER = None
+    DOWNSTREAM_GAGE_MAX_KM = 100.0
 
     def __init__(
         self,
@@ -48,6 +87,10 @@ class Tier3Processor:
         nodata_val=None,
         block_size=None,
         simplify_tol=None,
+        gages_shp=None,
+        flow_shp=None,
+        recurr_folder=None,
+        downstream_gage_max_km=None,
     ):
         # Class attributes are the defaults.
         if sensor_code is not None:
@@ -64,6 +107,14 @@ class Tier3Processor:
             self.BLOCK_SIZE = block_size
         if simplify_tol is not None:
             self.SIMPLIFY_TOL = simplify_tol
+        if gages_shp is not None:
+            self.GAGES_SHP = gages_shp
+        if flow_shp is not None:
+            self.FLOW_SHP = flow_shp
+        if recurr_folder is not None:
+            self.RECURR_FOLDER = recurr_folder
+        if downstream_gage_max_km is not None:
+            self.DOWNSTREAM_GAGE_MAX_KM = downstream_gage_max_km
 
         # Folder for intermediate rasters; set per run in process().
         self._work_dir = None
@@ -233,6 +284,8 @@ class Tier3Processor:
         name_list,
         flood_date,
     ):
+        # flood_date may carry the acquisition time, e.g. 20170504T235530
+        flood_day, acquisition_time_utc = split_flood_datetime(flood_date)
         with rasterio.open(src_4326) as src:
             meta = {
                 "File_Name": new_filename,
@@ -260,6 +313,13 @@ class Tier3Processor:
                 "Source": self.SOURCE,
                 "Location of the centroid of the flood map": (x, y),
                 "Flooding Event": flood_date,
+                "Date of the flooding": flood_day,
+                "Acquisition Time in UTC": acquisition_time_utc,
+                "Event Recurrence Interval (USGS)": None,
+                "Event Discharge (USGS) [cms]": None,
+                "USGS Gauge ID": None,
+                "Event Recurrence Interval (NWM)": None,
+                "Event Discharge (NWM) [cms]": None,
                 "Keywords": ["flood", "hazard", "GIS"],
                 "Access_Rights": "Public",
                 "Quality": self.Quality,
@@ -271,40 +331,53 @@ class Tier3Processor:
                 ],
             }
 
-            # Derive FIM boundary geometry (flooded pixels > 0)
-            arr = src.read(1, masked=True)
-            crs = src.crs
-            mask = arr > 0  # boolean mask for flooded areas
-
-            # Extract shapes (polygons) from the masked raster (only pixels > 0)
-            results = (
-                {"properties": {"raster_val": v}, "geometry": s}
-                for i, (s, v) in enumerate(shapes(arr, mask=mask, transform=src.transform))
-            )
-
+        # Flood polygon from the 5070 raster: every pixel > 0, dissolved
         with rasterio.open(src_5070) as src_geom:
-            arr = src_geom.read(1, masked=True)
             geom_crs = src_geom.crs
-            mask = arr > 0  # 1 is flood, 0 is dry
-
-            results = (
-                {"properties": {"raster_val": v}, "geometry": s}
-                for i, (s, v) in enumerate(shapes(arr, mask=mask, transform=src_geom.transform))
+            unified_geom = flood_polygon(
+                src_geom.read(1, masked=True), src_geom.transform, self.SIMPLIFY_TOL
             )
-
-        geoms = list(results)
-        if not geoms:
+        if unified_geom is None:
             self.log("No flooded areas found in 5070 raster.")
             return meta, None
 
-        gdf1 = gpd.GeoDataFrame.from_features(geoms)
-        gdf1.set_crs(geom_crs, inplace=True)
-
-        if self.SIMPLIFY_TOL:
-            gdf1["geometry"] = gdf1.simplify(self.SIMPLIFY_TOL, preserve_topology=True)
-            gdf1["geometry"] = gdf1.make_valid()
-
-        unified_geom = unary_union(gdf1.geometry)
+        # Event Recurrence Interval, computed against the unified flood
+        # polygon: USGS (observed gage discharge vs. published FFA) and NWM
+        # (modeled outlet discharge vs. NWM v2.1 RI tables), plus the
+        # discharge (cms) that produced each. flood_date here typically
+        # carries a UTC time (Tier 2/3), so the discharge used is the
+        # observation/model timestep nearest that exact instant rather than
+        # the day's max -- see recurrence_interval. USGS RI is "No USGS
+        # Gauge" when no gage was found and "No usable USGS Gauge" when none
+        # could be used; a field is None (logged, not
+        # raised) when its reference data isn't configured, or the lookup
+        # couldn't be attempted/resolved at all.
+        ri_usgs, discharge_usgs, _scenario_usgs, gauge_id_usgs = get_event_recurrence_interval_usgs(
+            unified_geom,
+            geom_crs,
+            flood_date,
+            gages_shp=self.GAGES_SHP,
+            flow_shp=self.FLOW_SHP,
+            downstream_max_km=self.DOWNSTREAM_GAGE_MAX_KM,
+            log=self.log,
+        )
+        ri_nwm, discharge_nwm, _scenario_nwm = get_event_recurrence_interval_nwm(
+            unified_geom,
+            geom_crs,
+            flood_date,
+            flow_shp=self.FLOW_SHP,
+            recurr_folder=self.RECURR_FOLDER,
+            log=self.log,
+        )
+        meta["Event Recurrence Interval (USGS)"] = ri_usgs
+        meta["Event Discharge (USGS) [cms]"] = (
+            round(discharge_usgs, 2) if discharge_usgs is not None else None
+        )
+        meta["USGS Gauge ID"] = gauge_id_usgs
+        meta["Event Recurrence Interval (NWM)"] = ri_nwm
+        meta["Event Discharge (NWM) [cms]"] = (
+            round(discharge_nwm, 2) if discharge_nwm is not None else None
+        )
 
         return meta, unified_geom
 
@@ -365,7 +438,22 @@ class Tier3Processor:
         gdf = gpd.GeoDataFrame([metadata_row], geometry=[unified], crs=crs)
         gdf.to_file(gpkg_path, layer="AOI", driver="GPKG")
 
-    def process(self, input_path, base_dest, flood_date=None, intermediate_folder=None):
+    # Unified flood polygon + selected metadata -> one-feature GeoJSON
+    def write_extent_geojson(self, unified_geom, geom_crs, meta_dict, geojson_dest, bm_filename):
+        out_path = Path(geojson_dest) / bm_filename.replace("BM.tif", "extent.geojson")
+        return write_extent_geojson(
+            unified_geom,
+            geom_crs,
+            meta_dict,
+            self.GEOJSON_FIELDS,
+            out_path,
+            simplify_tol=self.GEOJSON_SIMPLIFY_TOL,
+            log=self.log,
+        )
+
+    def process(
+        self, input_path, base_dest, flood_date=None, intermediate_folder=None, geojson_dest=None
+    ):
         """
         Process a folder of rasters or a single .tif.
 
@@ -374,8 +462,12 @@ class Tier3Processor:
         inferred, a single file stops with a notice; a folder skips that file.
         intermediate_folder: where temporary rasters are written; defaults to a
         fresh temp dir. Removed (best-effort) when processing finishes.
+        geojson_dest: folder for the per-map extent GeoJSON (unified flood
+        polygon + key metadata); must differ from base_dest. None skips it.
         """
         BASE_DEST = Path(base_dest)
+        if geojson_dest is not None and Path(geojson_dest).resolve() == BASE_DEST.resolve():
+            raise ValueError("geojson_dest must be a different folder from base_dest.")
 
         tif_list = list_input_tifs(input_path)
         if not tif_list:
@@ -479,6 +571,12 @@ class Tier3Processor:
                     self.raster_data_bbox(out_4326, gpkg_path, meta_dict, nodata=self.NODATA_VAL)
                     self.log(f"Wrote AOI: {gpkg_path.name}")
 
+                    # Extent GeoJSON (separate destination)
+                    if geojson_dest is not None:
+                        self.write_extent_geojson(
+                            unified_geom, 5070, meta_dict, geojson_dest, new_filename
+                        )
+
                 except Exception as e:
                     self.log(f"Skipped {tif.name} due to error: {e}")
                     import traceback
@@ -493,14 +591,21 @@ class Tier3Processor:
             self._work_dir = None
 
 
-def process(input_path, base_dest, flood_date=None, intermediate_folder=None, **overrides):
+def process(
+    input_path, base_dest, flood_date=None, intermediate_folder=None, geojson_dest=None, **overrides
+):
     """
     Convenience wrapper: run Tier3Processor over a folder or a single .tif.
 
     flood_date: pass it for a single raster, else inferred per file.
     intermediate_folder: temp raster dir (defaults to a temp dir, removed after).
+    geojson_dest: folder for the extent GeoJSON (None skips it).
     Config overrides (e.g. source=...) are passed to the processor.
     """
     Tier3Processor(**overrides).process(
-        input_path, base_dest, flood_date=flood_date, intermediate_folder=intermediate_folder
+        input_path,
+        base_dest,
+        flood_date=flood_date,
+        intermediate_folder=intermediate_folder,
+        geojson_dest=geojson_dest,
     )

@@ -33,6 +33,11 @@ dependencies = [
   "requests>=2.31",
   "mbutil>=0.3",
   "arcgis>=2.4",
+  "dataretrieval>=1.0",
+  "xarray>=2024.1",
+  "fsspec>=2024.1",
+  "s3fs>=2024.1",
+  "zarr>=2.10,<3",
 ]
 
 # The base install above is already complete. These per-module names remain
@@ -82,3 +87,5 @@ target-version = "py310"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+# Import fimbench straight from src/ so tests run without `pip install -e .`.
+pythonpath = ["src"]

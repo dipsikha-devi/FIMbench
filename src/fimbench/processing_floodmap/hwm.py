@@ -9,6 +9,7 @@ format: renamed GeoTIFF, metadata.json, and AOI.gpkg, using a user-supplied
 flood start and end date.
 """
 
+import re
 import json
 import shutil
 import tempfile
@@ -23,7 +24,11 @@ from shapely.validation import make_valid
 import geopandas as gpd
 
 from .._log import log as _log
-from .utils import get_intersected_huc8, list_input_tifs
+from .utils import get_intersected_huc8, list_input_tifs, flood_polygon, write_extent_geojson
+from .recurrence_interval import (
+    get_event_recurrence_interval_nwm_range,
+    get_event_recurrence_interval_usgs_range,
+)
 
 
 class HwmProcessor:
@@ -37,6 +42,35 @@ class HwmProcessor:
     BLOCK_SIZE = 512
     SIMPLIFY_TOL = 0.0001  # ~11 m at the equator
 
+    # Extent GeoJSON is simplified by this many metres (EPSG:5070) to stay
+    # light; the metadata/AOI geometry is not affected. None disables it.
+    GEOJSON_SIMPLIFY_TOL = 10.0
+
+    # metadata.json fields copied onto the extent GeoJSON feature.
+    GEOJSON_FIELDS = (
+        "File_Name",
+        "Full form of the sensor code",
+        "HUC8",
+        "Resolution in meter",
+        "Extent",
+        "State",
+        "River Basin Name",
+        "Start Date of the Flood",
+        "End Date of the Flood",
+        "Event Recurrence Interval (USGS)",
+        "Event Discharge (USGS) [cms]",
+        "USGS Gauge ID",
+        "Event Recurrence Interval (NWM)",
+        "Event Discharge (NWM) [cms]",
+    )
+
+    # Reference data for the Event Recurrence Interval lookups (see
+    # recurrence_interval.py). None disables the corresponding lookup.
+    GAGES_SHP = None
+    FLOW_SHP = None
+    RECURR_FOLDER = None
+    DOWNSTREAM_GAGE_MAX_KM = 100.0
+
     def __init__(
         self,
         *,
@@ -46,6 +80,10 @@ class HwmProcessor:
         nodata_val=None,
         block_size=None,
         simplify_tol=None,
+        gages_shp=None,
+        flow_shp=None,
+        recurr_folder=None,
+        downstream_gage_max_km=None,
     ):
         # Class attributes are the defaults.
         if sensor_code is not None:
@@ -60,6 +98,14 @@ class HwmProcessor:
             self.BLOCK_SIZE = block_size
         if simplify_tol is not None:
             self.SIMPLIFY_TOL = simplify_tol
+        if gages_shp is not None:
+            self.GAGES_SHP = gages_shp
+        if flow_shp is not None:
+            self.FLOW_SHP = flow_shp
+        if recurr_folder is not None:
+            self.RECURR_FOLDER = recurr_folder
+        if downstream_gage_max_km is not None:
+            self.DOWNSTREAM_GAGE_MAX_KM = downstream_gage_max_km
 
         # Folder for intermediate rasters; set per run in process().
         self._work_dir = None
@@ -72,6 +118,24 @@ class HwmProcessor:
         if self._work_dir is not None:
             return Path(self._work_dir) / name
         return Path(name)
+
+    # Two consecutive YYYYMMDD dates joined by "_" or "-": the flood window
+    # in an HWM name, e.g. HWM_10_0m_20100329_20100401_710139W415659N_BM.tif
+    _YMD = r"(?:19|20)\d{2}(?:0[1-9]|1[0-2])(?:0[1-9]|[12]\d|3[01])"
+    _WINDOW_RE = re.compile(rf"(?<!\d)({_YMD})[_-]({_YMD})(?!\d)")
+
+    def infer_flood_window_from_path(self, path: Path):
+        """
+        Extract (start_date, end_date) as "YYYYMMDD" strings from the file
+        name, else from its parent folders. Returns (None, None) if no
+        YYYYMMDD_YYYYMMDD pair is found.
+        """
+        path = Path(path)
+        for text in (path.name, path.as_posix()):
+            m = self._WINDOW_RE.search(text)
+            if m:
+                return m.group(1), m.group(2)
+        return None, None
 
     # Assign nodata, datatype and tile size
     def process_tif(self, input_tif, nodata_val=None, block_size=None):
@@ -270,6 +334,11 @@ class HwmProcessor:
                 "Location of the centroid of the flood map": (x, y),
                 "Start Date of the Flood": start_date,
                 "End Date of the Flood": end_date,
+                "Event Recurrence Interval (USGS)": None,
+                "Event Discharge (USGS) [cms]": None,
+                "USGS Gauge ID": None,
+                "Event Recurrence Interval (NWM)": None,
+                "Event Discharge (NWM) [cms]": None,
                 "Keywords": ["flood", "hazard", "GIS"],
                 "Access_Rights": "Public",
                 "References": [
@@ -280,31 +349,57 @@ class HwmProcessor:
                 ],
             }
 
-        # Generate polygons from the 5070 (resampled) raster
+        # Flood polygon from the 5070 raster: every pixel > 0, dissolved
         with rasterio.open(src_5070) as src_geom:
-            arr = src_geom.read(1, masked=True)
             geom_crs = src_geom.crs
-            mask = arr > 0  # 1 is flood, 0 is dry
-
-            results = (
-                {"properties": {"raster_val": v}, "geometry": s}
-                for i, (s, v) in enumerate(shapes(arr, mask=mask, transform=src_geom.transform))
+            unified_geom = flood_polygon(
+                src_geom.read(1, masked=True), src_geom.transform, self.SIMPLIFY_TOL
             )
-
-        geoms = list(results)
-        if not geoms:
+        if unified_geom is None:
             self.log("No flooded areas found in 5070 raster.")
             meta["FIM_Geometry"] = None
             return meta, None
 
-        gdf1 = gpd.GeoDataFrame.from_features(geoms)
-        gdf1.set_crs(geom_crs, inplace=True)
-
-        if self.SIMPLIFY_TOL:
-            gdf1["geometry"] = gdf1.simplify(self.SIMPLIFY_TOL, preserve_topology=True)
-            gdf1["geometry"] = gdf1.geometry.apply(make_valid)
-
-        unified_geom = unary_union(gdf1.geometry)
+        # Event Recurrence Interval, computed against the unified flood
+        # polygon: USGS (max observed gage discharge over [start_date,
+        # end_date] vs. published FFA) and NWM (max modeled outlet discharge
+        # over the same window vs. NWM v2.1 RI tables), plus the discharge
+        # (cms) that produced each. Unlike Tier 1/2/3 (a single event
+        # instant), HWM uses the MAXIMUM discharge anywhere in the
+        # user-supplied flood window -- see recurrence_interval's *_range
+        # functions. USGS RI is "No USGS Gauge" when no gage was found and
+        # "No usable USGS Gauge" when none could be used; a field is None (logged, not raised) when its reference
+        # data isn't configured, or the lookup couldn't be attempted at all.
+        ri_usgs, discharge_usgs, _scenario_usgs, gauge_id_usgs = (
+            get_event_recurrence_interval_usgs_range(
+                unified_geom,
+                geom_crs,
+                start_date,
+                end_date,
+                gages_shp=self.GAGES_SHP,
+                flow_shp=self.FLOW_SHP,
+                downstream_max_km=self.DOWNSTREAM_GAGE_MAX_KM,
+                log=self.log,
+            )
+        )
+        ri_nwm, discharge_nwm, _scenario_nwm = get_event_recurrence_interval_nwm_range(
+            unified_geom,
+            geom_crs,
+            start_date,
+            end_date,
+            flow_shp=self.FLOW_SHP,
+            recurr_folder=self.RECURR_FOLDER,
+            log=self.log,
+        )
+        meta["Event Recurrence Interval (USGS)"] = ri_usgs
+        meta["Event Discharge (USGS) [cms]"] = (
+            round(discharge_usgs, 2) if discharge_usgs is not None else None
+        )
+        meta["USGS Gauge ID"] = gauge_id_usgs
+        meta["Event Recurrence Interval (NWM)"] = ri_nwm
+        meta["Event Discharge (NWM) [cms]"] = (
+            round(discharge_nwm, 2) if discharge_nwm is not None else None
+        )
 
         return meta, unified_geom
 
@@ -359,22 +454,53 @@ class HwmProcessor:
         gdf = gpd.GeoDataFrame([metadata_row], geometry=[unified], crs=crs)
         gdf.to_file(gpkg_path, layer="AOI", driver="GPKG")
 
-    def process(self, input_path, base_dest, start_date, end_date, intermediate_folder=None):
+    # Unified flood polygon + selected metadata -> one-feature GeoJSON
+    def write_extent_geojson(self, unified_geom, geom_crs, meta_dict, geojson_dest, bm_filename):
+        out_path = Path(geojson_dest) / bm_filename.replace("BM.tif", "extent.geojson")
+        return write_extent_geojson(
+            unified_geom,
+            geom_crs,
+            meta_dict,
+            self.GEOJSON_FIELDS,
+            out_path,
+            simplify_tol=self.GEOJSON_SIMPLIFY_TOL,
+            log=self.log,
+        )
+
+    def process(
+        self,
+        input_path,
+        base_dest,
+        start_date=None,
+        end_date=None,
+        intermediate_folder=None,
+        geojson_dest=None,
+    ):
         """
         Process a folder of rasters or a single .tif.
 
-        start_date / end_date: the flood window (e.g. "160928" / "161009"),
-        applied to all files.
+        start_date / end_date: the flood window as "YYYYMMDD" (e.g.
+        "20160928" / "20161009"). Pass both to use them for every file;
+        leave both None to read each file's window from its name
+        (..._YYYYMMDD_YYYYMMDD_...). If it cannot be read, a single file
+        stops with an error; a folder skips that file.
         intermediate_folder: where temporary rasters are written; defaults to a
         fresh temp dir. Removed (best-effort) when processing finishes.
+        geojson_dest: folder for the per-map extent GeoJSON (unified flood
+        polygon + key metadata); must differ from base_dest. None skips it.
         """
         BASE_DEST = Path(base_dest)
+        if geojson_dest is not None and Path(geojson_dest).resolve() == BASE_DEST.resolve():
+            raise ValueError("geojson_dest must be a different folder from base_dest.")
+        if (start_date is None) != (end_date is None):
+            raise ValueError("Pass both start_date and end_date, or neither to read them per file.")
 
         tif_list = list_input_tifs(input_path)
         if not tif_list:
             self.log(f"No .tif files found under {input_path}")
             return
 
+        is_single = len(tif_list) == 1
         self.log(f"Found {len(tif_list)} .tif file(s) under {input_path}")
 
         # Set up the intermediate work dir (temp if not provided).
@@ -386,8 +512,24 @@ class HwmProcessor:
 
         try:
             for tif in tif_list:
+                # Resolve the flood window (outside the per-file try so a single
+                # un-datable file stops, while a folder run skips and continues).
+                if start_date is not None:
+                    file_start, file_end = start_date, end_date
+                else:
+                    file_start, file_end = self.infer_flood_window_from_path(tif)
+                if file_start is None:
+                    msg = (
+                        f"Could not read the flood window from {tif.name}; expected "
+                        "..._YYYYMMDD_YYYYMMDD_... or pass start_date/end_date."
+                    )
+                    if is_single:
+                        raise ValueError(msg)
+                    self.log(f"[notice] {msg} Skipping.")
+                    continue
+
                 try:
-                    self.log(f"Processing: {tif}")
+                    self.log(f"Processing: {tif} (flood window {file_start}-{file_end})")
 
                     # Pre-processing steps
                     nodata_tif = self.process_tif(tif)
@@ -404,7 +546,7 @@ class HwmProcessor:
 
                     # Metadata and geometry generation (called first to get the merged geometry)
                     temp_filename = (
-                        f"{self.SENSOR_CODE}_{res_str}_{start_date}_{end_date}_{dms_code}_BM.tif"
+                        f"{self.SENSOR_CODE}_{res_str}_{file_start}_{file_end}_{dms_code}_BM.tif"
                     )
 
                     meta_dict, unified_geom = self.build_metadata_dict(
@@ -419,8 +561,8 @@ class HwmProcessor:
                         "",
                         [],
                         [],
-                        start_date,
-                        end_date,
+                        file_start,
+                        file_end,
                     )
 
                     # HUC overlay via the ArcGIS REST service (geometry is in final_crs)
@@ -432,17 +574,17 @@ class HwmProcessor:
                     meta_dict["State"] = f"{state_list}, USA" if state_list else "USA"
                     meta_dict["Description"] = (
                         f"The Flood Inundation Map (FIM) was generated using USGS High Water Marks acquired "
-                        f"for the {start_date}-{end_date} flood with a spatial resolution of {res_txt}. "
+                        f"for the {file_start}-{file_end} flood with a spatial resolution of {res_txt}. "
                         f"The corresponding HUC IDs are {huc8_list}"
                     )
 
                     # File management
-                    folder_name = f"{self.SENSOR_CODE}_{start_date}_{end_date}_{dms_code}"
+                    folder_name = f"{self.SENSOR_CODE}_{file_start}_{file_end}_{dms_code}"
                     destination_folder = BASE_DEST / folder_name
                     destination_folder.mkdir(parents=True, exist_ok=True)
 
                     new_filename = (
-                        f"{self.SENSOR_CODE}_{res_str}_{start_date}_{end_date}_{dms_code}_BM.tif"
+                        f"{self.SENSOR_CODE}_{res_str}_{file_start}_{file_end}_{dms_code}_BM.tif"
                     )
                     new_path = destination_folder / new_filename
 
@@ -461,6 +603,12 @@ class HwmProcessor:
                     self.raster_data_bbox(out_4326, gpkg_path, meta_dict, nodata=self.NODATA_VAL)
                     self.log(f"Wrote AOI: {gpkg_path.name}")
 
+                    # Extent GeoJSON (separate destination)
+                    if geojson_dest is not None:
+                        self.write_extent_geojson(
+                            unified_geom, final_crs, meta_dict, geojson_dest, new_filename
+                        )
+
                 except Exception as e:
                     self.log(f"Error processing {tif.name}: {e}")
                     import traceback
@@ -475,14 +623,29 @@ class HwmProcessor:
             self._work_dir = None
 
 
-def process(input_path, base_dest, start_date, end_date, intermediate_folder=None, **overrides):
+def process(
+    input_path,
+    base_dest,
+    start_date=None,
+    end_date=None,
+    intermediate_folder=None,
+    geojson_dest=None,
+    **overrides,
+):
     """
     Convenience wrapper: run HwmProcessor over a folder or a single .tif.
 
-    start_date / end_date: the flood window (e.g. "160928" / "161009").
+    start_date / end_date: the flood window as "YYYYMMDD" (e.g. "20160928" /
+    "20161009"); leave both None to read each file's window from its name.
     intermediate_folder: temp raster dir (defaults to a temp dir, removed after).
+    geojson_dest: folder for the extent GeoJSON (None skips it).
     Config overrides (e.g. source=...) are passed to the processor.
     """
     HwmProcessor(**overrides).process(
-        input_path, base_dest, start_date, end_date, intermediate_folder=intermediate_folder
+        input_path,
+        base_dest,
+        start_date,
+        end_date,
+        intermediate_folder=intermediate_folder,
+        geojson_dest=geojson_dest,
     )

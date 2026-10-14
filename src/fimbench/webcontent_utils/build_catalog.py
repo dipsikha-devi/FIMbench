@@ -52,6 +52,19 @@ class FIMCatalogBuilder:
         )
 
         self._KNOWN_RP_VALUES = {2, 5, 10, 25, 50, 100, 200, 500, 1000}
+        self._SOURCE_QUALITY = {
+            "HWM": "High Water FIM",
+            "FEMA_BLE": "FEMA Base Level Engineering",
+        }
+        # metadata.json field -> catalog key
+        self._EVENT_FIELDS = {
+            "Event Recurrence Interval (USGS)": "recurrence_usgs",
+            "Event Recurrence Interval (NWM)": "recurrence_nwm",
+            "Event Discharge (USGS) [cms]": "discharge_usgs_cms",
+            "Event Discharge (NWM) [cms]": "discharge_nwm_cms",
+            "USGS Gauge ID": "usgs_gauge_id",
+            "Acquisition Time in UTC": "acquisition_time_utc",
+        }
         self._ymd_re = re.compile(r"(?<!\d)(\d{8})(?!\d)")
         self._TRAILING_COMMA_RE = re.compile(r",(\s*[}\]])")
         self._LINE_COMMENT_RE = re.compile(r"(^|[,{]\s*)//.*$", re.MULTILINE)
@@ -192,11 +205,20 @@ class FIMCatalogBuilder:
     def normalize_record(self, meta_key: str, meta: Dict[str, Any]) -> Dict[str, Any]:
         parts = meta_key.split("/")
 
+        # FEMA BLE maps (synthetic return-period maps) live under FEMA_BLE/
+        # and keep that as their tier label.
         tier_str = next(
-            (p for p in parts if p.lower().startswith("tier") or p.lower() == "hwm"), "Unknown_Tier"
+            (
+                p
+                for p in parts
+                if p.lower().startswith("tier") or p.lower() in {"hwm", "fema_ble"}
+            ),
+            "Unknown_Tier",
         )
         if tier_str.lower() == "hwm":
             tier = "HWM"
+        elif tier_str.lower() == "fema_ble":
+            tier = "FEMA_BLE"
         else:
             m_tier = re.match(r"(?i)\s*tier[_\s-]*(\d)\b", tier_str.strip())
             tier = f"Tier_{m_tier.group(1)}" if m_tier else tier_str
@@ -235,7 +257,7 @@ class FIMCatalogBuilder:
             if start_date_ymd:
                 event_ts = int(start_date_ymd.replace("-", ""))
 
-        elif tier == "Tier_4":
+        elif tier in {"FEMA_BLE", "Tier_4"}:
             rp_field = self._safe_get(
                 meta,
                 "Synthetic Flooding Event (return period (years))",
@@ -250,7 +272,9 @@ class FIMCatalogBuilder:
                         break
 
         else:  # Tier 1, 2, 3
-            flooding_event = self._safe_get(meta, "Flooding Event")
+            flooding_event = self._safe_get(
+                meta, "Date-Time of the Flooding Event", "Flooding Event"
+            )
             date_ymd = self._extract_ymd_iso(flooding_event)
             event_ts = self._extract_event_ts(flooding_event)
 
@@ -263,7 +287,7 @@ class FIMCatalogBuilder:
             "date_ymd": date_ymd,  # Tier 1/2/3 flood date
             "start_date_ymd": start_date_ymd,  # HWM only
             "end_date_ymd": end_date_ymd,  # HWM only
-            "return_period": return_period,  # Tier 4 only
+            "return_period": return_period,  # FEMA_BLE only
             **({"event_ts": event_ts} if tier in {"Tier_1", "Tier_2", "Tier_3"} else {}),
             "json_url": f"https://{self.bucket}.s3.amazonaws.com/{meta_key}",
             "s3_prefix": folder,
@@ -282,12 +306,24 @@ class FIMCatalogBuilder:
             "description": self._safe_get(meta, "Description"),
             "references": meta.get("References"),
         }
+        # HWM and FEMA BLE maps have no quality tier in their metadata; label
+        # them by data source instead.
+        if tier in self._SOURCE_QUALITY:
+            core["quality"] = self._SOURCE_QUALITY[tier]
 
         for k in ("HUC2", "HUC4", "HUC6", "HUC8", "HUC10", "HUC12"):
             if k in meta:
                 core[k.lower()] = (
                     [str(v) for v in meta[k]] if isinstance(meta[k], list) else str(meta[k])
                 )
+
+        # Event magnitude and acquisition time, copied as-is (including text
+        # such as "No usable USGS Gauge") so the map popup can show them
+        # without fetching the metadata JSON. Only for records whose metadata
+        # has the field: none for FEMA BLE, acquisition time for Tier 2/3.
+        for src_key, core_key in self._EVENT_FIELDS.items():
+            if src_key in meta:
+                core[core_key] = meta[src_key]
 
         return core
 

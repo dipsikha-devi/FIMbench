@@ -566,7 +566,7 @@ class benchFIMquery:
                     For HWM records, matches if the ranges overlap.
         file_name: exact benchmark filename(s) from the catalog.
         tier: filter by data tier. Accepts flexible formats: 'HWM', 'hwm',
-              'Tier1', 'tier_1', 'Tier 1', 'Tier_2', 'tier3', 'Tier_4', etc.
+              'Tier1', 'tier_1', 'Tier 1', 'Tier_2', 'tier3', 'FEMA_BLE' (or 'Tier_4'), etc.
         area: if True and AOI is given, compute overlap % and km².
         download: if True, download matched rasters/GPKGs.
         out_dir: target directory for downloads. When omitted with download=True,

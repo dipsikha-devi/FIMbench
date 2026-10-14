@@ -4,7 +4,7 @@ import geopandas as gpd
 import numpy as np
 import os
 from shapely.geometry import Polygon, MultiPolygon, mapping
-from shapely import simplify, set_precision
+from shapely import make_valid, simplify, set_precision
 
 from .._log import log as _log
 
@@ -46,6 +46,16 @@ def round_coords(geom, precision=5):
     elif geom.geom_type == "MultiPolygon":
         return MultiPolygon([round_coords(p, precision) for p in geom.geoms])
     return geom
+
+
+def repair_polygonal(geom):
+    # The "structure" method rebuilds the polygon from its rings and drops
+    # collapsed parts, so the result is always a valid (Multi)Polygon -- the
+    # default method can return touching polygons or stray lines instead.
+    if geom is None or geom.is_empty or geom.is_valid:
+        return geom
+    fixed = make_valid(geom, method="structure", keep_collapsed=False)
+    return geom if fixed.is_empty else fixed
 
 
 def process_flood_extents(
@@ -91,6 +101,10 @@ def process_flood_extents(
     gdf = gdf.to_crs("EPSG:4326")
     gdf["geometry"] = gdf["geometry"].apply(lambda g: round_coords(g, coord_precision))
 
+    # Smoothing and coordinate rounding can make rings touch or cross;
+    # repair last so every output geometry is valid (polygonal parts only).
+    gdf["geometry"] = gdf["geometry"].apply(repair_polygonal)
+
     _log("Assembling output GeoJSON...")
     features = []
     for i, row in gdf.iterrows():
@@ -115,8 +129,8 @@ def process_flood_extents(
 
 if __name__ == "__main__":
     process_flood_extents(
-        input_path="/Users/Supath/Downloads/SDML/FIMeval/geojson_FIMextents/merged_output1.geojson",
-        output_path="/Users/Supath/Downloads/SDML/FIMeval/fim_viz/FIM_extents.geojson",
+        input_path="path/to/merged_extents.geojson",
+        output_path="path/to/FIM_extents.geojson",
         pre_tolerance=30,
         post_tolerance=5,
         smooth_iterations=5,
