@@ -56,14 +56,20 @@ class FIMCatalogBuilder:
             "HWM": "High Water FIM",
             "FEMA_BLE": "FEMA Base Level Engineering",
         }
-        # metadata.json field -> catalog key
+        # metadata.json field -> catalog key (older and newer metadata names)
         self._EVENT_FIELDS = {
             "Event Recurrence Interval (USGS)": "recurrence_usgs",
             "Event Recurrence Interval (NWM)": "recurrence_nwm",
+            "Event Recurrence Interval (USGS) [yr]": "recurrence_usgs",
+            "Event Recurrence Interval (NWM) [yr]": "recurrence_nwm",
             "Event Discharge (USGS) [cms]": "discharge_usgs_cms",
+            "Recurrence Interval Discharge (USGS) [cms]": "discharge_usgs_cms",
             "Event Discharge (NWM) [cms]": "discharge_nwm_cms",
+            "Recurrence Interval Discharge (NWM) [cms]": "discharge_nwm_cms",
             "USGS Gauge ID": "usgs_gauge_id",
+            "Reference USGS Streamgauge ID": "usgs_gauge_id",
             "Acquisition Time in UTC": "acquisition_time_utc",
+            "Image acquisition time (UTC)": "acquisition_time_utc",
         }
         self._ymd_re = re.compile(r"(?<!\d)(\d{8})(?!\d)")
         self._TRAILING_COMMA_RE = re.compile(r",(\s*[}\]])")
@@ -120,7 +126,7 @@ class FIMCatalogBuilder:
             except json.JSONDecodeError as e:
                 lines = raw.splitlines()
                 i, j = max(0, e.lineno - 3), min(len(lines), e.lineno + 2)
-                ctx = "\n".join(f"{k+1:>5}: {lines[k]}" for k in range(i, j))
+                ctx = "\n".join(f"{k + 1:>5}: {lines[k]}" for k in range(i, j))
                 raise ValueError(f"Bad JSON at {where}: {e.msg} (line {e.lineno})\n{ctx}")
 
     # Extraction Helpers
@@ -175,13 +181,17 @@ class FIMCatalogBuilder:
             return None
 
     def _centroid_from_meta(self, meta: Dict[str, Any]) -> Tuple[float, float]:
-        c = meta.get("Location of the centroid of the flood map")
+        c = self._safe_get(
+            meta,
+            "Map centroid coordinates (longitude, latitude)",
+            "Location of the centroid of the flood map",
+        )
         if isinstance(c, list) and len(c) >= 2:
             try:
                 return float(c[0]), float(c[1])
             except:
                 pass
-        ex = meta.get("Extent") or {}
+        ex = self._safe_get(meta, "Bounding box", "Extent") or {}
         try:
             lon = (float(ex.get("xmin")) + float(ex.get("xmax"))) / 2.0
             lat = (float(ex.get("ymin")) + float(ex.get("ymax"))) / 2.0
@@ -190,7 +200,7 @@ class FIMCatalogBuilder:
             return 0.0, 0.0
 
     def _bbox_from_extent(self, meta: Dict[str, Any]) -> Optional[List[float]]:
-        ex = meta.get("Extent") or {}
+        ex = self._safe_get(meta, "Bounding box", "Extent") or {}
         try:
             return [
                 float(ex["xmin"]),
@@ -208,11 +218,7 @@ class FIMCatalogBuilder:
         # FEMA BLE maps (synthetic return-period maps) live under FEMA_BLE/
         # and keep that as their tier label.
         tier_str = next(
-            (
-                p
-                for p in parts
-                if p.lower().startswith("tier") or p.lower() in {"hwm", "fema_ble"}
-            ),
+            (p for p in parts if p.lower().startswith("tier") or p.lower() in {"hwm", "fema_ble"}),
             "Unknown_Tier",
         )
         if tier_str.lower() == "hwm":
@@ -251,8 +257,12 @@ class FIMCatalogBuilder:
         return_period = None
 
         if tier == "HWM":
-            start_date_ymd = self._extract_ymd_iso(self._safe_get(meta, "Start Date of the Flood"))
-            end_date_ymd = self._extract_ymd_iso(self._safe_get(meta, "End Date of the Flood"))
+            start_date_ymd = self._extract_ymd_iso(
+                self._safe_get(meta, "Start Date of Flood", "Start Date of the Flood")
+            )
+            end_date_ymd = self._extract_ymd_iso(
+                self._safe_get(meta, "End Date of Flood", "End Date of the Flood")
+            )
             # event_ts anchored to start date for sorting
             if start_date_ymd:
                 event_ts = int(start_date_ymd.replace("-", ""))
@@ -260,6 +270,7 @@ class FIMCatalogBuilder:
         elif tier in {"FEMA_BLE", "Tier_4"}:
             rp_field = self._safe_get(
                 meta,
+                "Return period [yr]",
                 "Synthetic Flooding Event (return period (years))",
                 "Return Period",
                 "RP",
@@ -273,7 +284,11 @@ class FIMCatalogBuilder:
 
         else:  # Tier 1, 2, 3
             flooding_event = self._safe_get(
-                meta, "Date-Time of the Flooding Event", "Flooding Event"
+                meta,
+                "Image acquisition datetime (UTC)",
+                "Image acquisition date",
+                "Date-Time of the Flooding Event",
+                "Flooding Event",
             )
             date_ymd = self._extract_ymd_iso(flooding_event)
             event_ts = self._extract_event_ts(flooding_event)
@@ -295,14 +310,17 @@ class FIMCatalogBuilder:
             "gpkg_url": gpkg_url,
             "centroid": [lon, lat],
             "bbox": self._bbox_from_extent(meta),
-            "resolution_m": self._safe_get(meta, "Resolution in meter", "Resolution (m)"),
+            "resolution_m": self._safe_get(
+                meta, "Spatial resolution (m)", "Resolution in meter", "Resolution (m)"
+            ),
             "state": self._safe_get(meta, "State"),
-            "basin": self._safe_get(meta, "River Basin Name"),
-            "source": self._safe_get(meta, "Source"),
-            "access_rights": self._safe_get(meta, "Access_Rights"),
+            "basin": self._safe_get(meta, "River Basin Name(s)", "River Basin Name"),
+            "source": self._safe_get(meta, "Data provider", "Source"),
+            "access_rights": self._safe_get(meta, "Access Rights", "Access_Rights"),
             "file_name": file_name,
             "s3_key": meta_key,
-            "quality": self._safe_get(meta, "Quality") or tier,
+            "quality": self._safe_get(meta, "Product Category", "Quality") or tier,
+            "platform": self._safe_get(meta, "Full sensor name", "Full form of the sensor code"),
             "description": self._safe_get(meta, "Description"),
             "references": meta.get("References"),
         }
@@ -316,6 +334,10 @@ class FIMCatalogBuilder:
                 core[k.lower()] = (
                     [str(v) for v in meta[k]] if isinstance(meta[k], list) else str(meta[k])
                 )
+        # Newer metadata (e.g. Tier 1) names the HUC8 list "HUC8 ID(s)".
+        if "huc8" not in core and "HUC8 ID(s)" in meta:
+            v = meta["HUC8 ID(s)"]
+            core["huc8"] = [str(x) for x in v] if isinstance(v, list) else str(v)
 
         # Event magnitude and acquisition time, copied as-is (including text
         # such as "No usable USGS Gauge") so the map popup can show them

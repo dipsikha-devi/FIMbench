@@ -64,14 +64,14 @@ downstream_gage_max_km = None  # default 100.0 km downstream USGS gage search ra
 
 # def test_processing_tier2_folder():
 # fimbench.Tier2Processor(nodata_val=nodata_val, block_size=block_size, simplify_tol=simplify_tol,gages_shp=gages_shp,flow_shp=flow_shp,recurr_folder=recurr_folder,downstream_gage_max_km=downstream_gage_max_km).process(
-#  input_folder, out_dir, intermediate_folder=intermediate_folder, geojson_dest=geojson_dest
+# input_folder, out_dir, intermediate_folder=intermediate_folder, geojson_dest=geojson_dest
 # )
 
 
-# def test_processing_tier2_single():
-#     fimbench.Tier2Processor(source=source, nodata_val=nodata_val, block_size=block_size, simplify_tol=simplify_tol).process(
-#         input_tif, out_dir, flood_date=flood_date, intermediate_folder=intermediate_folder, geojson_dest=geojson_dest
-#     )
+# def test_processing_tier2_single():##
+# fimbench.Tier2Processor(nodata_val=nodata_val, block_size=block_size, simplify_tol=simplify_tol).process(
+# input_tif, out_dir, flood_date=flood_date, intermediate_folder=intermediate_folder, geojson_dest=geojson_dest
+# )
 
 
 # def test_processing_tier3_folder():
@@ -86,35 +86,35 @@ downstream_gage_max_km = None  # default 100.0 km downstream USGS gage search ra
 # ).process(input_tif, out_dir, flood_date=flood_date, intermediate_folder=intermediate_folder, geojson_dest=geojson_dest)
 
 
-def test_processing_fema_ble():
-    fimbench.FemaBleProcessor(
-        nodata_val=nodata_val, block_size=block_size, simplify_tol=simplify_tol
-    ).process(
-        input_folder,
-        out_dir,
-        event,
-        intermediate_folder=intermediate_folder,
-        geojson_dest=geojson_dest,
-    )
-
-
-# def test_processing_hwm_folder():
-# Folder: each file's start/end date is read from its name
-# (..._YYYYMMDD_YYYYMMDD_...); a file without one is skipped
-# fimbench.HwmProcessor(
-# nodata_val=nodata_val,
-# block_size=block_size,
-# simplify_tol=simplify_tol,
-# gages_shp=gages_shp,
-# flow_shp=flow_shp,
-# recurr_folder=recurr_folder,
-# downstream_gage_max_km=downstream_gage_max_km,
+# def test_processing_fema_ble():
+# fimbench.FemaBleProcessor(
+# nodata_val=nodata_val, block_size=block_size, simplify_tol=simplify_tol
 # ).process(
 # input_folder,
 # out_dir,
+# event,
 # intermediate_folder=intermediate_folder,
-# geojson_dest=geojson_dest,
+#  geojson_dest=geojson_dest,
 # )
+
+
+def test_processing_hwm_folder():
+    # Folder: each file's start/end date is read from its name
+    # (..._YYYYMMDD_YYYYMMDD_...); a file without one is skipped
+    fimbench.HwmProcessor(
+        nodata_val=nodata_val,
+        block_size=block_size,
+        simplify_tol=simplify_tol,
+        gages_shp=gages_shp,
+        flow_shp=flow_shp,
+        recurr_folder=recurr_folder,
+        downstream_gage_max_km=downstream_gage_max_km,
+    ).process(
+        input_folder,
+        out_dir,
+        intermediate_folder=intermediate_folder,
+        geojson_dest=geojson_dest,
+    )
 
 
 # def test_processing_hwm_single():

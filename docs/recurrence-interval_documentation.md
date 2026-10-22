@@ -350,7 +350,7 @@ Scenario string:
 
 > A downstream gage measures flow from a larger drainage area than the
 > flooded reach. Its RI is a proxy for how severe the event was regionally,
-> rather than a direct measurement at the flood. Check `USGS Gauge ID` and
+> rather than a direct measurement at the flood. Check `Reference USGS Streamgauge ID` and
 > the log when interpreting it.
 
 ### Scenario 3: no usable USGS gage, so rely on NWM
@@ -456,9 +456,9 @@ The discharge is then classified (Section 10).
 
 ### 9.4 NWM outcomes
 
-| Case | `Event Recurrence Interval (NWM)` | `Event Discharge (NWM) [cms]` |
+| Case | `Event Recurrence Interval (NWM) [yr]` | `Recurrence Interval Discharge (NWM) [cms]` |
 |---|---|---|
-| Success | `"25 yr"`, `"< 2 yr"`, `"> 100 yr"`, … | Modeled discharge |
+| Success | `25`, `"< 2"`, `"> 100"`, … | Modeled discharge |
 | `flow_shp` / `recurr_folder` missing | `"NWM not configured"` | `null` |
 | Empty geometry | `"Invalid flood geometry"` | `null` |
 | Unparseable date | `"Could not parse flood_date"` (HWM: `"Could not parse start_date/end_date"`) | `null` |
@@ -583,11 +583,17 @@ copies them onto the extent GeoJSON feature:
 
 | Field | Type | Possible values |
 |---|---|---|
-| `Event Recurrence Interval (USGS)` | string / null | `"2 yr"` … `"100 yr"`, `"< 2 yr"`, `"> 100 yr"`; `"No USGS Gauge"`; `"No usable USGS Gauge"`; `null` (not attempted / not configured / no flood pixels) |
-| `Event Discharge (USGS) [cms]` | number / null | Observed discharge, rounded to 2 decimals. `null` unless the label is a classified return period |
-| `USGS Gauge ID` | string / null | USGS site number of the gage that produced the label. `null` unless the label is a classified return period |
-| `Event Recurrence Interval (NWM)` | string / null | A classified return period, or a reason string (see [Section 9.4](#94-nwm-outcomes)). `null` only if there are no flood pixels |
-| `Event Discharge (NWM) [cms]` | number / null | Modeled discharge at the outlet, rounded to 2 decimals. It can be present even when the label is a reason (COMID missing from the RI tables) |
+| `Event Recurrence Interval (USGS) [yr]` | number / string / null | Return period in years: `2` … `100`; `"< 2"` or `"> 100"` outside the published range; `"No USGS Gauge"`; `"No usable USGS Gauge"`; `null` (not attempted / not configured / no flood pixels) |
+| `Recurrence Interval Discharge (USGS) [cms]` | number / null | Observed discharge, rounded to 2 decimals. `null` unless a return period was assigned |
+| `Reference USGS Streamgauge ID` | string / null | USGS site number of the gage that produced the value. `null` unless a return period was assigned |
+| `Event Recurrence Interval (NWM) [yr]` | number / string / null | A return period as above, or a reason string (see [Section 9.4](#94-nwm-outcomes)). `null` only if there are no flood pixels |
+| `Recurrence Interval Discharge (NWM) [cms]` | number / null | Modeled discharge at the outlet, rounded to 2 decimals. It can be present even when the value is a reason (COMID missing from the RI tables) |
+
+The classification itself (Section 10) produces labels such as `"25 yr"`;
+the metadata stores them as years (`25`), since the field name already says
+`[yr]`. The catalog copies these values into `recurrence_usgs`,
+`recurrence_nwm`, `discharge_usgs_cms`, `discharge_nwm_cms` and
+`usgs_gauge_id`.
 
 ### Reading the two estimates together
 

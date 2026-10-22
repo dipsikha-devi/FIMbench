@@ -306,6 +306,21 @@ def _downstream_gages_from_outlet(
     return out
 
 
+def ri_years(label):
+    """
+    A recurrence-interval label as years, for fields whose name already says
+    [yr]: "25 yr" -> 25, "> 100 yr" -> "> 100", "< 2 yr" -> "< 2". Anything
+    else (None, "No USGS Gauge", an NWM failure reason) is returned unchanged.
+    """
+    if not isinstance(label, str):
+        return label
+    m = re.fullmatch(r"\s*([<>]?)\s*(\d+)\s*yr\s*", label)
+    if not m:
+        return label
+    sign, years = m.groups()
+    return f"{sign} {years}" if sign else int(years)
+
+
 def _classify_ri(discharge_cms, ri_map):
     """Match a discharge to a recurrence interval. ri_map = {year: discharge_cms}.
     Returns (label, year_or_None, ri_discharge_cms)."""

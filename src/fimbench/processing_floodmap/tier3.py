@@ -9,10 +9,12 @@ renamed GeoTIFF, metadata.json, and AOI.gpkg per flood map.
 """
 
 import re
+import copy
 import json
 import shutil
 import tempfile
 from pathlib import Path
+from typing import ClassVar
 import numpy as np
 import rasterio
 from rasterio.features import shapes
@@ -33,6 +35,7 @@ from .utils import (
 from .recurrence_interval import (
     get_event_recurrence_interval_nwm,
     get_event_recurrence_interval_usgs,
+    ri_years,
 )
 
 
@@ -40,9 +43,28 @@ class Tier3Processor:
     """Standardize Tier 3 (Sentinel 1A) flood maps for the FIM database."""
 
     SENSOR_CODE = "S1A"
-    Full_Form = "Sentinel-1A"
-    SOURCE = "Dr. Dan Tian,The University of Alabama, Email id: dtian1@ua.edu"
-    Quality = "Tier 3"
+    # Fixed metadata.json values, keyed by their field names (as in
+    # GEOJSON_FIELDS). full_form=, data_provider= and quality= override them.
+    METADATA_FIELDS: ClassVar[dict] = {
+        "Full sensor name": "Sentinel-1A",
+        # Nominal Sentinel-1 resolution, used everywhere instead of the
+        # measured pixel size: file names (S1A_10_0m_...), metadata, description.
+        "Spatial resolution (m)": 10,
+        "Data provider": "Dr. Dan Tian, The University of Alabama. Email ID: dtian1@ua.edu",
+        "Recurrence Interval Methodology Documentation": "https://github.com/sdmlua/fimbench/blob/main/docs/recurrence-interval_documentation.md",
+        "Keywords": ["flood inundation", "benchmark dataset", "geospatial data", "sentinel-1"],
+        "Access Rights": "Public",
+        "Product Category": "Tier 3",
+        "Metadata Documentation": "https://github.com/sdmlua/fimbench/blob/main/docs/metadata_documentation.md",
+        "References": [
+            "1. Tian, D., Liu, H., Wang, L., Cohen, S., & Mandal, T. (2026). RS-FloodXDepth: Enhancing remote sensing-derived flood extent and estimating flood depth using a hydrologically guided region-growing method and high-resolution DEMs. Water Resources Research, 62, e2025WR042384. https://doi.org/10.1029/2025WR042384",
+            "2. Cohen, S., Baruah, A., Nikrou, P., Tian, D., & Liu, H. (2025). Toward robust evaluations of flood inundation predictions using remote sensing derived benchmark maps. Water Resources Research, 61(8), e2024WR039574. https://doi.org/10.1029/2024WR039574",
+        ],
+    }
+
+    # METADATA_FIELDS written at a fixed position near the top of
+    # metadata.json; the rest follow the recurrence-interval fields.
+    _PLACED_FIELDS = ("Full sensor name", "Spatial resolution (m)", "Data provider")
 
     NODATA_VAL = -9999
     BLOCK_SIZE = 512
@@ -54,20 +76,20 @@ class Tier3Processor:
 
     # metadata.json fields copied onto the extent GeoJSON feature.
     GEOJSON_FIELDS = (
-        "File_Name",
-        "Full form of the sensor code",
-        "HUC8",
-        "Resolution in meter",
-        "Extent",
+        "File Name",
+        "Full sensor name",
+        "HUC8 ID(s)",
+        "Spatial resolution (m)",
+        "Bounding box",
         "State",
-        "River Basin Name",
-        "Flooding Event",
-        "Event Recurrence Interval (USGS)",
-        "Event Discharge (USGS) [cms]",
-        "USGS Gauge ID",
-        "Event Recurrence Interval (NWM)",
-        "Event Discharge (NWM) [cms]",
-        "Quality",
+        "River Basin Name(s)",
+        "Image acquisition datetime (UTC)",
+        "Event Recurrence Interval (USGS) [yr]",
+        "Recurrence Interval Discharge (USGS) [cms]",
+        "Reference USGS Streamgauge ID",
+        "Event Recurrence Interval (NWM) [yr]",
+        "Recurrence Interval Discharge (NWM) [cms]",
+        "Product Category",
     )
 
     # Reference data for the Event Recurrence Interval lookups (see
@@ -82,6 +104,7 @@ class Tier3Processor:
         *,
         sensor_code=None,
         full_form=None,
+        data_provider=None,
         source=None,
         quality=None,
         nodata_val=None,
@@ -92,15 +115,20 @@ class Tier3Processor:
         recurr_folder=None,
         downstream_gage_max_km=None,
     ):
-        # Class attributes are the defaults.
+        # Class attributes are the defaults; each processor gets its own copy
+        # of METADATA_FIELDS so overrides never change the class defaults.
+        self.METADATA_FIELDS = copy.deepcopy(self.METADATA_FIELDS)
         if sensor_code is not None:
             self.SENSOR_CODE = sensor_code
         if full_form is not None:
-            self.Full_Form = full_form
-        if source is not None:
-            self.SOURCE = source
+            self.METADATA_FIELDS["Full sensor name"] = full_form
+        # source= is the older name for data_provider=
+        if data_provider is not None or source is not None:
+            self.METADATA_FIELDS["Data provider"] = (
+                data_provider if data_provider is not None else source
+            )
         if quality is not None:
-            self.Quality = quality
+            self.METADATA_FIELDS["Product Category"] = quality
         if nodata_val is not None:
             self.NODATA_VAL = nodata_val
         if block_size is not None:
@@ -203,13 +231,13 @@ class Tier3Processor:
         return output_file
 
     # Extract the resolution from the projected file
-    def get_resolution_string(self, geo_tif_5070):
-        with rasterio.open(geo_tif_5070) as src:
-            res_x, res_y = src.res
-            avg_res = (res_x + res_y) / 2.0
-            rounded_res = round(avg_res, 1)
-            res_str = f"{str(rounded_res).replace('.', '_')}m"  # e.g., 10.0 -> "10_0m"
-            res_txt = f"{rounded_res:.2f} m"
+    def get_resolution_string(self, geo_tif_5070=None):
+        # Tier 3 always uses the nominal Sentinel-1 resolution from
+        # METADATA_FIELDS (10 m), not the measured pixel size, so file names,
+        # metadata and description agree.
+        rounded_res = float(self.METADATA_FIELDS["Spatial resolution (m)"])
+        res_str = f"{str(rounded_res).replace('.', '_')}m"  # e.g., 10.0 -> "10_0m"
+        res_txt = f"{rounded_res:.2f} m"
         return rounded_res, res_str, res_txt
 
     def get_raster_centroid(self, out_4326):
@@ -245,7 +273,7 @@ class Tier3Processor:
         # YYYYMMDD with optional T/separator and time. Captures: 20170502, 20170502T161000, 20170502_161000
         m_iso = re.search(
             r"(?P<date>20\d{2}(?:0[1-9]|1[0-2])(?:0[1-9]|[12]\d|3[01]))"  # YYYYMMDD
-            r"(?:[Tt_](?P<time>\d{6}))?",  # Optional Time
+            r"(?:[Tt_](?P<time>\d{6})(?![\dNSEWnsew]))?",  # Optional Time, not a DMS code
             s,
         )
         if m_iso:
@@ -269,6 +297,30 @@ class Tier3Processor:
 
         return default
 
+    @staticmethod
+    def describe(flood_date, res_m, huc8_list):
+        """Description text, e.g. "Flood Inundation Map (FIM) generated using
+        Sentinel-1 Imagery acquired on 2017-05-04 at 23:55:30 UTC, ...".
+        The time is left out when flood_date has none."""
+        day, time_utc = split_flood_datetime(flood_date)
+        when = f"{day[:4]}-{day[4:6]}-{day[6:8]}" if len(day) >= 8 else day
+        if time_utc:
+            when += f" at {time_utc} UTC"
+        hucs = [str(h) for h in huc8_list or []]
+        if len(hucs) > 1:
+            covers = (
+                f" and covers portions of HUC8 watersheds {', '.join(hucs[:-1])} and {hucs[-1]}"
+            )
+        elif hucs:
+            covers = f" and covers portions of HUC8 watershed {hucs[0]}"
+        else:
+            covers = ""
+        return (
+            f"Flood Inundation Map (FIM) generated using Sentinel-1 Imagery acquired on {when}, "
+            "with a gap-filling algorithm applied to reconstruct inundation in unmapped areas. "
+            f"The map has a nominal spatial resolution of {res_m:g} m{covers}."
+        )
+
     def build_metadata_dict(
         self,
         src_4326,
@@ -286,49 +338,48 @@ class Tier3Processor:
     ):
         # flood_date may carry the acquisition time, e.g. 20170504T235530
         flood_day, acquisition_time_utc = split_flood_datetime(flood_date)
+        fixed = self.METADATA_FIELDS
         with rasterio.open(src_4326) as src:
             meta = {
-                "File_Name": new_filename,
-                "Full form of the sensor code": self.Full_Form,
-                "HUC8": huc8_list,
+                "File Name": new_filename,
+                "Full sensor name": fixed["Full sensor name"],
+                "HUC8 ID(s)": huc8_list,
                 "Format": src.driver,
                 "Nodata_Value": src.nodata,
-                "Resolution in meter": res_m_float,
+                "Spatial resolution (m)": fixed["Spatial resolution (m)"],
                 "Datatype": src.dtypes[0],
-                "Compression Type": src.tags(ns="IMAGE_STRUCTURE"),
-                "Extent": {
+                "Compression type": src.tags(ns="IMAGE_STRUCTURE"),
+                "Bounding box": {
                     "xmin": src.bounds.left,
                     "ymin": src.bounds.bottom,
                     "xmax": src.bounds.right,
                     "ymax": src.bounds.top,
                 },
-                "DMS_Code_centroid": dms_code,
-                "Projection": src.crs.to_string() if src.crs else "Unknown",
-                "Bands": src.count,
+                "Centroid DMS code": dms_code,
+                "Coordinate reference system": src.crs.to_string() if src.crs else "Unknown",
+                "Number of bands": src.count,
                 "Rows": src.height,
                 "Columns": src.width,
-                "State": f"{state_list}, USA" if state_list else "USA",
-                "Description": f"",
-                "River Basin Name": name_list,
-                "Source": self.SOURCE,
-                "Location of the centroid of the flood map": (x, y),
-                "Flooding Event": flood_date,
-                "Date of the flooding": flood_day,
-                "Acquisition Time in UTC": acquisition_time_utc,
-                "Event Recurrence Interval (USGS)": None,
-                "Event Discharge (USGS) [cms]": None,
-                "USGS Gauge ID": None,
-                "Event Recurrence Interval (NWM)": None,
-                "Event Discharge (NWM) [cms]": None,
-                "Keywords": ["flood", "hazard", "GIS"],
-                "Access_Rights": "Public",
-                "Quality": self.Quality,
-                "References": [
-                    "1. Cohen, S., Baruah, A., Nikrou, P., Tian, D., & Liu, H. (2025). Toward robust evaluations of flood inundation predictions using remote sensing derived benchmark maps. Water Resources Research, 61(8), e2024WR039574.",
-                    "2. Munasinghe, D., Cohen, S., Tian, D., Liu, H., Baruah, A., and Devi, D. (2025). A Database of Flood Maps using high-resolution Airborne Imagery and Machine Learning Models. In: CIROH Developers’ Conference, May 28-30, 2025.",
-                    "3. Devi, D., Dhital, S., Munasinghe, D., Cohen, S., Baruah, A., Chen, Y., ... & Pruitt, C. (2025). A Framework for the Evaluation of Flood Inundation Predictions Over Extensive Benchmark Databases.",
-                    "4. Tian.D, Liu.H,  Wang.L, Cohen.S, Thapa.P (2024).Enhancing satellite image-derived flood maps with hydrologically guided region growing method and high-resolution DEMs.Chapman Conference on Remote Sensing of the Water Cycle",
-                ],
+                "State": state_list or None,
+                "Description": "",
+                "River Basin Name(s)": name_list,
+                "Data provider": fixed["Data provider"],
+                "Map centroid coordinates (longitude, latitude)": (x, y),
+                "Image acquisition datetime (UTC)": flood_date,
+                "Image acquisition date": flood_day,
+                "Image acquisition time (UTC)": acquisition_time_utc,
+                "Event Recurrence Interval (USGS) [yr]": None,
+                "Recurrence Interval Discharge (USGS) [cms]": None,
+                "Reference USGS Streamgauge ID": None,
+                "Event Recurrence Interval (NWM) [yr]": None,
+                "Recurrence Interval Discharge (NWM) [cms]": None,
+                # The remaining METADATA_FIELDS, under their own names and in
+                # table order, so renaming a key there needs no change here.
+                **{
+                    k: list(v) if isinstance(v, (list, tuple)) else v
+                    for k, v in fixed.items()
+                    if k not in self._PLACED_FIELDS
+                },
             }
 
         # Flood polygon from the 5070 raster: every pixel > 0, dissolved
@@ -369,13 +420,15 @@ class Tier3Processor:
             recurr_folder=self.RECURR_FOLDER,
             log=self.log,
         )
-        meta["Event Recurrence Interval (USGS)"] = ri_usgs
-        meta["Event Discharge (USGS) [cms]"] = (
+        # Years as a number ("2 yr" -> 2); "> 100" / "< 2" and no-estimate text
+        # (e.g. "No usable USGS Gauge") stay as text.
+        meta["Event Recurrence Interval (USGS) [yr]"] = ri_years(ri_usgs)
+        meta["Recurrence Interval Discharge (USGS) [cms]"] = (
             round(discharge_usgs, 2) if discharge_usgs is not None else None
         )
-        meta["USGS Gauge ID"] = gauge_id_usgs
-        meta["Event Recurrence Interval (NWM)"] = ri_nwm
-        meta["Event Discharge (NWM) [cms]"] = (
+        meta["Reference USGS Streamgauge ID"] = gauge_id_usgs
+        meta["Event Recurrence Interval (NWM) [yr]"] = ri_years(ri_nwm)
+        meta["Recurrence Interval Discharge (NWM) [cms]"] = (
             round(discharge_nwm, 2) if discharge_nwm is not None else None
         )
 
@@ -537,13 +590,11 @@ class Tier3Processor:
                     huc8_list, name_list, state_list = get_intersected_huc8(unified_geom, 5070)
 
                     # Update the metadata dictionary with the actual HUC results
-                    meta_dict["HUC8"] = huc8_list
-                    meta_dict["River Basin Name"] = name_list
-                    meta_dict["State"] = f"{state_list}, USA" if state_list else "USA"
-                    meta_dict["Description"] = (
-                        f"The Flood Inundation Map (FIM) was generated using Sentinel-1 Imagery combined with a gap-filled algorithm "
-                        f"for the {file_flood_date} flood with a spatial resolution of {res_txt}. "
-                        f"The corresponding HUC IDs are {huc8_list}"
+                    meta_dict["HUC8 ID(s)"] = huc8_list
+                    meta_dict["River Basin Name(s)"] = name_list
+                    meta_dict["State"] = state_list or None
+                    meta_dict["Description"] = self.describe(
+                        file_flood_date, self.METADATA_FIELDS["Spatial resolution (m)"], huc8_list
                     )
 
                     # File management

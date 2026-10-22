@@ -129,10 +129,10 @@ Each lifecycle stage has a runnable notebook walkthrough under `docs/`:
 
 ## Citing this tool
 
-1. Cohen, S., Baruah, A., Nikrou, P., Tian, D., & Liu, H. (2025). Toward robust evaluations of flood inundation predictions using remote sensing derived benchmark maps. *Water Resources Research*, 61(8), e2024WR039574.
-2. Munasinghe, D., Cohen, S., Tian, D., Liu, H., Baruah, A., and Devi, D. (2025). A Database of Flood Maps using high-resolution Airborne Imagery and Machine Learning Models. In: *CIROH Developers' Conference*, May 28–30, 2025.
-3. Devi, D., Dhital, S., Munasinghe, D., Cohen, S., Baruah, A., Chen, Y., ... & Pruitt, C. (2025). A Framework for the Evaluation of Flood Inundation Predictions Over Extensive Benchmark Databases.
-4. Tian, D., Liu, H., Wang, L., Cohen, S., Thapa, P. (2024). Enhancing satellite image-derived flood maps with hydrologically guided region growing method and high-resolution DEMs. *Chapman Conference on Remote Sensing of the Water Cycle*.
+1. Cohen, S., Baruah, A., Nikrou, P., Tian, D., & Liu, H. (2025). Toward robust evaluations of flood inundation predictions using remote sensing derived benchmark maps. *Water Resources Research*, 61(8), e2024WR039574. https://doi.org/10.1029/2024WR039574
+2. Devi, D., Dhital, S., Munasinghe, D., Cohen, S., Baruah, A., Chen, Y., ... & Pruitt, C. (2025). A Framework for the Evaluation of Flood Inundation Predictions Over Extensive Benchmark Databases. https://doi.org/10.1016/j.envsoft.2025.106786
+3. Tian, D., Liu, H., Wang, L., Cohen, S., & Mandal, T. (2026). RS-FloodXDepth: Enhancing remote sensing-derived flood extent and estimating flood depth using a hydrologically guided region-growing method and high-resolution DEMs. *Water Resources Research*, 62, e2025WR042384. https://doi.org/10.1029/2025WR042384
+4. Baruah, A., Munasinghe, D., Cohen, S., Abdelkader, M., Devi, D., Chen, Y., ... & McDermott, R. (2026). Brief communication: Rise of the Guadalupe River – a multifaceted post event analysis of 4 July 2025, flood in Central Texas. *Natural Hazards and Earth System Sciences*, 26(10), 4753–4762. https://doi.org/10.5194/nhess-26-4753-2026
 
 ## Contributing
 

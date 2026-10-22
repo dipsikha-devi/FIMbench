@@ -8,10 +8,12 @@ Standardizes FEMA BLE synthetic (return-period) flood rasters into the FIM
 database format: renamed GeoTIFF, metadata.json, and AOI.gpkg per flood map.
 """
 
+import copy
 import json
 import shutil
 import tempfile
 from pathlib import Path
+from typing import ClassVar
 import numpy as np
 import rasterio
 from rasterio.features import shapes
@@ -29,8 +31,33 @@ class FemaBleProcessor:
     """Standardize FEMA Base Level Engineering flood maps for the FIM database."""
 
     SENSOR_CODE = "BLE"
-    Full_Form = "Base Level Engineering"
-    SOURCE = "NOAA/NWS Office of Water Prediction (OWP)"
+    # Fixed metadata.json values, keyed by their field names (as in
+    # GEOJSON_FIELDS). full_form=, data_provider= and quality= override them.
+    METADATA_FIELDS: ClassVar[dict] = {
+        "Full sensor name": "Base Level Engineering",
+        # Nominal BLE resolution, used everywhere instead of the measured
+        # pixel size: file names (BLE_10_0m_...), metadata, description.
+        "Spatial resolution (m)": 10,
+        "Data provider": "NOAA/NWS Office of Water Prediction (OWP)",
+        "Keywords": [
+            "flood inundation",
+            "benchmark dataset",
+            "geospatial data",
+            "fema",
+            "base level engineering",
+        ],
+        "Access Rights": "Public",
+        "Product Category": "FEMA_BLE",
+        "Metadata Documentation": "https://github.com/sdmlua/fimbench/blob/main/docs/metadata_documentation.md",
+        "References": [
+            "1. Aristizabal, F., Salas, F., Petrochenkov, G., Grout, T., Avant, B., Bates, B., ... & Judge, J. (2023). Extending height above nearest drainage to model multiple fluvial sources in flood inundation mapping applications for the US National Water Model. Water Resources Research, 59(5), e2022WR032039. https://doi.org/10.1029/2022WR032039",
+            "2. Devi, D., Dhital, S., Munasinghe, D., Cohen, S., Baruah, A., Chen, Y., ... & Pruitt, C. (2025). A Framework for the Evaluation of Flood Inundation Predictions Over Extensive Benchmark Databases. https://doi.org/10.1016/j.envsoft.2025.106786",
+        ],
+    }
+
+    # METADATA_FIELDS written at a fixed position near the top of
+    # metadata.json; the rest follow the return period.
+    _PLACED_FIELDS = ("Full sensor name", "Spatial resolution (m)", "Data provider")
 
     NODATA_VAL = -9999
     BLOCK_SIZE = 512
@@ -42,14 +69,15 @@ class FemaBleProcessor:
 
     # metadata.json fields copied onto the extent GeoJSON feature.
     GEOJSON_FIELDS = (
-        "File_Name",
-        "Full form of the sensor code",
-        "HUC8",
-        "Resolution in meter",
-        "Extent",
+        "File Name",
+        "Full sensor name",
+        "HUC8 ID(s)",
+        "Spatial resolution (m)",
+        "Bounding box",
         "State",
-        "River Basin Name",
-        "Synthetic Flooding Event (return period (years))",
+        "River Basin Name(s)",
+        "Return period [yr]",
+        "Product Category",
     )
 
     def __init__(
@@ -57,18 +85,27 @@ class FemaBleProcessor:
         *,
         sensor_code=None,
         full_form=None,
+        data_provider=None,
         source=None,
+        quality=None,
         nodata_val=None,
         block_size=None,
         simplify_tol=None,
     ):
-        # Class attributes are the defaults.
+        # Class attributes are the defaults; each processor gets its own copy
+        # of METADATA_FIELDS so overrides never change the class defaults.
+        self.METADATA_FIELDS = copy.deepcopy(self.METADATA_FIELDS)
         if sensor_code is not None:
             self.SENSOR_CODE = sensor_code
         if full_form is not None:
-            self.Full_Form = full_form
-        if source is not None:
-            self.SOURCE = source
+            self.METADATA_FIELDS["Full sensor name"] = full_form
+        # source= is the older name for data_provider=
+        if data_provider is not None or source is not None:
+            self.METADATA_FIELDS["Data provider"] = (
+                data_provider if data_provider is not None else source
+            )
+        if quality is not None:
+            self.METADATA_FIELDS["Product Category"] = quality
         if nodata_val is not None:
             self.NODATA_VAL = nodata_val
         if block_size is not None:
@@ -163,13 +200,13 @@ class FemaBleProcessor:
         return output_file
 
     # Extract the resolution from the projected file
-    def get_resolution_string(self, geo_tif_5070):
-        with rasterio.open(geo_tif_5070) as src:
-            res_x, res_y = src.res
-            avg_res = (res_x + res_y) / 2.0
-            rounded_res = round(avg_res, 1)
-            res_str = f"{str(rounded_res).replace('.', '_')}m"  # e.g., 10.0 -> "10_0m"
-            res_txt = f"{rounded_res:.2f} m"
+    def get_resolution_string(self, geo_tif_5070=None):
+        # FEMA BLE always uses the nominal resolution from METADATA_FIELDS
+        # (10 m), not the measured pixel size, so file names, metadata and
+        # description agree.
+        rounded_res = float(self.METADATA_FIELDS["Spatial resolution (m)"])
+        res_str = f"{str(rounded_res).replace('.', '_')}m"  # e.g., 10.0 -> "10_0m"
+        res_txt = f"{rounded_res:g} m"  # e.g., "10 m"
         return rounded_res, res_str, res_txt
 
     def get_raster_centroid(self, out_4326):
@@ -211,41 +248,42 @@ class FemaBleProcessor:
         name_list,
         EVENT,
     ):
+        fixed = self.METADATA_FIELDS
         with rasterio.open(src_4326) as src:
             meta = {
-                "File_Name": new_filename,
-                "Full form of the sensor code": self.Full_Form,
-                "HUC8": huc8_list,
+                "File Name": new_filename,
+                "Full sensor name": fixed["Full sensor name"],
+                "HUC8 ID(s)": huc8_list,
                 "Format": src.driver,
                 "Nodata_Value": src.nodata,
-                "Resolution in meter": res_m_float,
+                "Spatial resolution (m)": fixed["Spatial resolution (m)"],
                 "Datatype": src.dtypes[0],
-                "Compression Type": src.tags(ns="IMAGE_STRUCTURE"),
-                "Extent": {
+                "Compression type": src.tags(ns="IMAGE_STRUCTURE"),
+                "Bounding box": {
                     "xmin": src.bounds.left,
                     "ymin": src.bounds.bottom,
                     "xmax": src.bounds.right,
                     "ymax": src.bounds.top,
                 },
-                "DMS_Code_centroid": dms_code,
-                "Projection": src.crs.to_string() if src.crs else "Unknown",
-                "Bands": src.count,
+                "Centroid DMS code": dms_code,
+                "Coordinate reference system": src.crs.to_string() if src.crs else "Unknown",
+                "Number of bands": src.count,
                 "Rows": src.height,
                 "Columns": src.width,
-                "State": f"{state_list}, USA" if state_list else "USA",
-                "Description": f"",
-                "River Basin Name": name_list,
-                "Source": self.SOURCE,
-                "Location of the centroid of the flood map": (x, y),
-                "Synthetic Flooding Event (return period (years))": EVENT,
-                "Keywords": ["flood", "hazard", "GIS"],
-                "Access_Rights": "Public",
-                "References": [
-                    "1. Cohen, S., Baruah, A., Nikrou, P., Tian, D., & Liu, H. (2025). Toward robust evaluations of flood inundation predictions using remote sensing derived benchmark maps. Water Resources Research, 61(8), e2024WR039574.",
-                    "2. Munasinghe, D., Cohen, S., Tian, D., Liu, H., Baruah, A., and Devi, D. (2025). A Database of Flood Maps using high-resolution Airborne Imagery and Machine Learning Models. In: CIROH Developers' Conference, May 28-30, 2025.",
-                    "3. Devi, D., Dhital, S., Munasinghe, D., Cohen, S., Baruah, A., Chen, Y., ... & Pruitt, C. (2025). A Framework for the Evaluation of Flood Inundation Predictions Over Extensive Benchmark Databases.",
-                    "4. Tian.D, Liu.H,  Wang.L, Cohen.S, Thapa.P (2024).Enhancing satellite image-derived flood maps with hydrologically guided region growing method and high-resolution DEMs.Chapman Conference on Remote Sensing of the Water Cycle",
-                ],
+                "State": state_list or None,
+                "Description": "",
+                "River Basin Name(s)": name_list,
+                "Data provider": fixed["Data provider"],
+                "Map centroid coordinates (longitude, latitude)": (x, y),
+                # Years as a number ("100" -> 100), like the recurrence fields.
+                "Return period [yr]": int(EVENT) if str(EVENT).strip().isdigit() else EVENT,
+                # The remaining METADATA_FIELDS, under their own names and in
+                # table order, so renaming a key there needs no change here.
+                **{
+                    k: list(v) if isinstance(v, (list, tuple)) else v
+                    for k, v in fixed.items()
+                    if k not in self._PLACED_FIELDS
+                },
             }
 
         # Flood polygon from the 5070 raster: every pixel > 0, dissolved
@@ -401,9 +439,9 @@ class FemaBleProcessor:
                     )
 
                     # Update the metadata dictionary with the actual HUC results
-                    meta_dict["HUC8"] = huc8_list
-                    meta_dict["River Basin Name"] = name_list
-                    meta_dict["State"] = f"{state_list}, USA" if state_list else "USA"
+                    meta_dict["HUC8 ID(s)"] = huc8_list
+                    meta_dict["River Basin Name(s)"] = name_list
+                    meta_dict["State"] = state_list or None
                     meta_dict["Description"] = (
                         f"The Flood Inundation Map (FIM) corresponds to FEMA Base Level Engineering "
                         f"for the {EVENT} flood with a spatial resolution of {res_txt}. "
